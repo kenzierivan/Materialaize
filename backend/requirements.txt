@@ -1,7 +1,11 @@
 fastapi
 uvicorn[standard]
-transformers
-torch
+transformers==5.3.0
+accelerate
 peft
+torch
 safetensors
 tokenizers
+selfies==1.0.3
+rdkit-pypi
+numpy

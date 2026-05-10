@@ -17,35 +17,61 @@ const PHASES = [
   "RANKING_CANDIDATES",
 ];
 
-type Candidate = {
-  id: string;
-  smiles: string;
-  healing: number;
-  tg: string;
-  tensile: string;
-  motif: string;
-  score: number;
+type Molecule = {
+  selfies: string;
+  smiles: string | null;
+  valid: boolean;
+  canonical_smiles?: string;
+  is_polymer?: boolean;
+  molecular_weight?: number;
+  num_heavy_atoms?: number;
+  num_rings?: number;
+  motifs_found?: string[];
+  has_any_sh_motif?: boolean;
+  has_strict_sh?: boolean;
+  sa_score?: number | null;
+  synthesisable?: boolean | null;
 };
+
+// Backend may return either a number or the literal string "N/A" for any
+// metric that depends on optional state (e.g. SA scorer not loaded, < 2 valid
+// molecules for diversity). Using a permissive number|string union.
+type BatchMetrics = {
+  "validity_%": number;
+  n_valid: number;
+  n_total: number;
+  "continuation_polymer_%": number;
+  "uniqueness_%": number;
+  diversity: number | string;
+  "self_healing_motif_%": number;
+  "strict_sh_%": number;
+  mean_sa_score: number | string;
+  "synthesisable_%": number | string;
+  [perMotif: string]: number | string | null | undefined;
+};
+
+type Candidate = Molecule & { id: string; shScore: number };
 
 // ─── API ──────────────────────────────────────────────────────────────────────
 
 type GenerateResponse = {
-  molecules: string[];
-  prompt_used: string;
+  seed: string;
+  molecules: Molecule[];
+  batch_metrics: BatchMetrics;
 };
 
 async function generateMolecules(
   seed: string,
   numMolecules: number,
-): Promise<string[]> {
+): Promise<{ molecules: Molecule[]; batchMetrics: BatchMetrics }> {
   const res = await fetch(`${API_URL}/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      prompt: seed,
+      seed,
       num_molecules: numMolecules,
-      max_length: 128,
-      temperature: 1.0,
+      max_new_tokens: 80,
+      temperature: 0.8,
       top_k: 50,
       top_p: 0.95,
     }),
@@ -55,56 +81,54 @@ async function generateMolecules(
     throw new Error(`Backend ${res.status}: ${text || res.statusText}`);
   }
   const data = (await res.json()) as GenerateResponse;
-  return data.molecules;
+  return { molecules: data.molecules, batchMetrics: data.batch_metrics };
 }
 
-// ChemGPT only emits SMILES — healing/Tg/tensile/motif/score are illustrative
-// values derived deterministically from the string so the same molecule always
-// renders the same numbers. Swap in a real property predictor when available.
-function deriveMetrics(smiles: string): Candidate {
+// Deterministic FNV hash → MTZ-XXXX card label.
+function makeId(seed: string): string {
   let h = 2166136261;
-  for (let i = 0; i < smiles.length; i++) {
-    h ^= smiles.charCodeAt(i);
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i);
     h = Math.imul(h, 16777619);
   }
-  const u = (shift: number, mod: number) => Math.abs((h >>> shift) % mod);
-
   const hex = ((h >>> 0).toString(16) + "00000000").slice(0, 8).toUpperCase();
-  const id = `MTZ-${hex.slice(0, 4)}`;
+  return `MTZ-${hex.slice(0, 4)}`;
+}
 
-  const hasDisulfide = /SS/.test(smiles);
-  const hasUrea = /NC\(=O\)N/.test(smiles);
-  const hasAmide = /C\(=O\)N/.test(smiles);
-  const hasHydroxyl = /OH|O\)/.test(smiles);
-  const hasAlkene = /C=C/.test(smiles);
-  const hasEster = /C\(=O\)O/.test(smiles);
+// Composite "Self-Healing Quality" — combines real backend signals into one
+// 0-100 number per candidate so cards can be compared at a glance:
+//   +45 strict SH motif (disulfide/urea — real covalent-exchange chemistries)
+//   +20 any other SH motif (amide H-bond, furan, imine, boronic ester, DA)
+//   +20 polymer continuation (* atoms — model thinks this extends as a chain)
+//   +20 synthesisable (SA score ≤ 6)
+//   +15 MW in monomer/oligomer range (100–600 g/mol)
+function selfHealingScore(m: Molecule): number {
+  if (!m.valid) return 0;
+  let s = 0;
+  if (m.has_strict_sh) s += 45;
+  else if (m.has_any_sh_motif) s += 20;
+  if (m.is_polymer) s += 20;
+  if (m.synthesisable === true) s += 20;
+  const mw = m.molecular_weight ?? 0;
+  if (mw >= 100 && mw <= 600) s += 15;
+  return Math.min(100, s);
+}
 
-  let motif = "covalent network";
-  if (hasDisulfide && hasUrea) motif = "disulfide / urea";
-  else if (hasDisulfide) motif = "disulfide exchange";
-  else if (hasUrea) motif = "urea h-bond";
-  else if (hasEster) motif = "transesterification";
-  else if (hasAlkene) motif = "Diels-Alder";
-  else if (hasAmide) motif = "amide / h-bond";
-  else if (hasHydroxyl) motif = "h-bond array";
+function toCandidate(m: Molecule): Candidate {
+  // Backend sends smiles=null for failed decodes — skip it for ID hashing
+  // (otherwise multiple invalid candidates collide on the same fallback).
+  const idSeed = m.canonical_smiles || m.selfies || "?";
+  return { ...m, id: makeId(idSeed), shScore: selfHealingScore(m) };
+}
 
-  const healing = Math.min(
-    99,
-    55 + u(0, 18) + (hasDisulfide ? 14 : 0) + (hasUrea ? 8 : 0),
-  );
-  const tg = -55 + u(8, 95);
-  const tensile = 22 + u(16, 70);
-  const score = 0.7 + u(24, 250) / 1000;
-
-  return {
-    id,
-    smiles,
-    healing,
-    tg: `${tg > 0 ? "+" : tg === 0 ? "" : "−"}${Math.abs(tg)}°C`,
-    tensile: `${tensile} MPa`,
-    motif,
-    score: Number(score.toFixed(3)),
-  };
+// Format a metric that could be a number or the literal string "N/A".
+function formatMetric(
+  v: number | string | null | undefined,
+  digits: number,
+): string {
+  if (typeof v === "number") return v.toFixed(digits);
+  if (typeof v === "string") return v;
+  return "N/A";
 }
 
 // ─── Lattice Canvas ───────────────────────────────────────────────────────────
@@ -459,7 +483,9 @@ function HeroInput({ onSubmit }: { onSubmit: (seed: string) => void }) {
 
   const submit = (e?: React.FormEvent) => {
     e?.preventDefault();
-    onSubmit(value.trim() || "C(=C/C(=O)NCCSSCC)\\C(=O)O");
+    // Default seed: a self-healing polymer (urea + disulfide motifs) with *
+    // endpoints. Keep simple — backend rejects seeds that can't be SELFIES-encoded.
+    onSubmit(value.trim() || "*NC(=O)NCCSSCC*");
   };
 
   const bracketColor = focused ? ACCENT : "var(--border-strong)";
@@ -534,7 +560,7 @@ function HeroInput({ onSubmit }: { onSubmit: (seed: string) => void }) {
             onChange={(e) => setValue(e.target.value)}
             onFocus={() => setFocused(true)}
             onBlur={() => setFocused(false)}
-            placeholder="C(=C/C(=O)NCCSSCC)\C(=O)O"
+            placeholder="*NC(=O)NCCSSCC*"
             spellCheck={false}
             autoComplete="off"
             style={{
@@ -1025,28 +1051,67 @@ function Stat({
   );
 }
 
-function CandidateCard({ c, index }: { c: Candidate; index: number }) {
+function CandidateCard({
+  c,
+  index,
+  total,
+}: {
+  c: Candidate;
+  index: number;
+  total: number;
+}) {
+  const motifList =
+    c.motifs_found && c.motifs_found.length > 0
+      ? c.motifs_found.map((m) => m.replace(/_/g, " ")).join(", ")
+      : "none detected";
+
+  const flags: string[] = [];
+  if (c.has_strict_sh) flags.push("STRICT-SH");
+  if (c.is_polymer) flags.push("POLYMER");
+  if (c.synthesisable === true) flags.push("SYNTHESISABLE");
+  else if (c.synthesisable === false) flags.push("LOW SYNTH");
+  const flagText = flags.length ? flags.join(" · ") : "—";
+
+  const synthLabel =
+    c.sa_score == null
+      ? "N/A"
+      : c.sa_score <= 4
+        ? "easy"
+        : c.sa_score <= 6
+          ? "moderate"
+          : "hard";
+
+  const borderColor = c.valid ? "var(--border)" : "#44222a";
+  const bracketColor = c.valid ? "var(--border-strong)" : "#66333d";
+  const idColor = c.valid ? ACCENT : "#ff8899";
+
+  // Valid → show canonical SMILES; invalid → show raw SELFIES so user can
+  // see what the model actually emitted.
+  const displaySmiles = c.valid
+    ? c.canonical_smiles || c.smiles || "(empty output)"
+    : c.selfies || "(empty output)";
+
   return (
     <div
       style={{
-        border: "1px solid var(--border)",
+        border: `1px solid ${borderColor}`,
         background: "rgba(10,13,16,0.6)",
         padding: 24,
         position: "relative",
         animation: `slideUp 0.5s ${index * 0.08}s both ease-out`,
       }}
     >
-      <Bracket pos="tl" color="var(--border-strong)" />
-      <Bracket pos="tr" color="var(--border-strong)" />
-      <Bracket pos="bl" color="var(--border-strong)" />
-      <Bracket pos="br" color="var(--border-strong)" />
+      <Bracket pos="tl" color={bracketColor} />
+      <Bracket pos="tr" color={bracketColor} />
+      <Bracket pos="bl" color={bracketColor} />
+      <Bracket pos="br" color={bracketColor} />
 
       <div
         style={{
           display: "flex",
           justifyContent: "space-between",
           alignItems: "baseline",
-          marginBottom: 16,
+          marginBottom: 14,
         }}
       >
         <div
@@ -1054,10 +1119,15 @@ function CandidateCard({ c, index }: { c: Candidate; index: number }) {
             fontFamily: "var(--mono)",
             fontSize: 11,
             letterSpacing: "0.18em",
-            color: ACCENT,
+            color: idColor,
           }}
         >
           {c.id}
+          {!c.valid && (
+            <span style={{ marginLeft: 12, color: "#ff8899" }}>
+              · INVALID SMILES
+            </span>
+          )}
         </div>
         <div
           style={{
@@ -1067,9 +1137,49 @@ function CandidateCard({ c, index }: { c: Candidate; index: number }) {
             color: "var(--fg-dim)",
           }}
         >
-          SCORE <span style={{ color: "var(--fg)" }}>{c.score.toFixed(3)}</span>
+          #{index + 1}
+          <span style={{ opacity: 0.5 }}> / {total}</span>
         </div>
       </div>
+
+      {c.valid && (
+        <div style={{ marginBottom: 16 }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              fontFamily: "var(--mono)",
+              fontSize: 9,
+              letterSpacing: "0.18em",
+              color: "var(--fg-dim)",
+              marginBottom: 6,
+            }}
+          >
+            <span>SELF-HEALING QUALITY</span>
+            <span style={{ color: ACCENT }}>{c.shScore}/100</span>
+          </div>
+          <div
+            style={{
+              height: 4,
+              background: "var(--border)",
+              position: "relative",
+            }}
+          >
+            <div
+              style={{
+                position: "absolute",
+                left: 0,
+                top: 0,
+                bottom: 0,
+                width: `${c.shScore}%`,
+                background: ACCENT,
+                boxShadow: c.shScore > 0 ? `0 0 8px ${ACCENT}88` : undefined,
+                transition: "width 0.3s",
+              }}
+            />
+          </div>
+        </div>
+      )}
 
       <div
         style={{
@@ -1084,53 +1194,163 @@ function CandidateCard({ c, index }: { c: Candidate; index: number }) {
           marginBottom: 16,
         }}
       >
-        {c.smiles}
+        {displaySmiles}
       </div>
 
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(3, 1fr)",
-          gap: 1,
-          background: "var(--border)",
-          border: "1px solid var(--border)",
-          marginBottom: 16,
-        }}
-      >
-        <Stat label="HEALING" value={`${c.healing}%`} bar={c.healing} />
-        <Stat label="TG" value={c.tg} />
-        <Stat label="TENSILE" value={c.tensile} />
-      </div>
+      {c.valid ? (
+        <>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(3, 1fr)",
+              gap: 1,
+              background: "var(--border)",
+              border: "1px solid var(--border)",
+              marginBottom: 16,
+            }}
+          >
+            <Stat
+              label="MW (g/mol)"
+              value={
+                c.molecular_weight != null
+                  ? c.molecular_weight.toFixed(1)
+                  : "—"
+              }
+            />
+            <Stat
+              label={`SYNTH · ${synthLabel}`}
+              value={c.sa_score != null ? c.sa_score.toFixed(2) : "N/A"}
+            />
+            <Stat
+              label="RINGS · ATOMS"
+              value={`${c.num_rings ?? "—"} · ${c.num_heavy_atoms ?? "—"}`}
+            />
+          </div>
 
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          fontFamily: "var(--mono)",
-          fontSize: 10,
-          letterSpacing: "0.16em",
-          textTransform: "uppercase",
-          color: "var(--fg-dim)",
-        }}
-      >
-        <span>
-          MOTIF · <span style={{ color: "var(--fg)" }}>{c.motif}</span>
-        </span>
-        <span style={{ color: ACCENT, cursor: "pointer" }}>EXPAND →</span>
-      </div>
+          <div
+            style={{
+              fontFamily: "var(--mono)",
+              fontSize: 10,
+              letterSpacing: "0.16em",
+              textTransform: "uppercase",
+              color: "var(--fg-dim)",
+              lineHeight: 1.9,
+            }}
+          >
+            <div>
+              MOTIFS ·{" "}
+              <span
+                style={{
+                  color: c.has_any_sh_motif ? ACCENT : "var(--fg)",
+                }}
+              >
+                {motifList}
+              </span>
+            </div>
+            <div>
+              FLAGS · <span style={{ color: "var(--fg)" }}>{flagText}</span>
+            </div>
+          </div>
+        </>
+      ) : (
+        <div
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            color: "#ff8899",
+            padding: 12,
+            border: "1px solid #44222a",
+            background: "rgba(60,10,20,0.2)",
+          }}
+        >
+          ▸ RDKit could not parse this output as a valid molecule.
+        </div>
+      )}
     </div>
   );
 }
 
 // ─── Results ──────────────────────────────────────────────────────────────────
 
+function BatchStrip({ b }: { b: BatchMetrics | null }) {
+  if (!b) return null;
+  // Note: diversity / mean_sa_score / synthesisable_% can be the literal
+  // string "N/A" (when SA scorer is unavailable or <2 valid molecules) — the
+  // formatMetric helper handles both number and string cases.
+  const items: { k: string; v: string; accent?: boolean }[] = [
+    {
+      k: "VALIDITY",
+      v: `${b["validity_%"]}% (${b.n_valid}/${b.n_total})`,
+    },
+    { k: "UNIQUE", v: `${b["uniqueness_%"]}%` },
+    {
+      k: "SH MOTIF",
+      v: `${b["self_healing_motif_%"]}%`,
+      accent: b["self_healing_motif_%"] > 0,
+    },
+    {
+      k: "STRICT SH",
+      v: `${b["strict_sh_%"]}%`,
+      accent: b["strict_sh_%"] > 0,
+    },
+    { k: "MEAN SA", v: formatMetric(b.mean_sa_score, 2) },
+    { k: "DIVERSITY", v: formatMetric(b.diversity, 3) },
+  ];
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexWrap: "wrap",
+        marginBottom: 32,
+        border: "1px solid var(--border)",
+        background: "rgba(10,13,16,0.6)",
+      }}
+    >
+      {items.map((it, i) => (
+        <div
+          key={it.k}
+          style={{
+            flex: "1 1 120px",
+            padding: "14px 18px",
+            borderRight:
+              i < items.length - 1 ? "1px solid var(--border)" : "none",
+          }}
+        >
+          <div
+            style={{
+              fontFamily: "var(--mono)",
+              fontSize: 9,
+              letterSpacing: "0.18em",
+              color: "var(--fg-dim)",
+              marginBottom: 4,
+            }}
+          >
+            {it.k}
+          </div>
+          <div
+            style={{
+              fontFamily: "var(--mono)",
+              fontSize: 14,
+              color: it.accent ? ACCENT : "var(--fg)",
+            }}
+          >
+            {it.v}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function Results({
   seed,
   candidates,
+  batchMetrics,
   onClose,
 }: {
   seed: string;
   candidates: Candidate[];
+  batchMetrics: BatchMetrics | null;
   onClose: () => void;
 }) {
   const batch = candidates[0]?.id.replace("MTZ-", "").slice(0, 3) ?? "000";
@@ -1215,6 +1435,8 @@ function Results({
           </button>
         </div>
 
+        <BatchStrip b={batchMetrics} />
+
         <div
           style={{
             display: "grid",
@@ -1223,7 +1445,12 @@ function Results({
           }}
         >
           {candidates.map((c, i) => (
-            <CandidateCard key={`${c.id}-${i}`} c={c} index={i} />
+            <CandidateCard
+              key={`${c.id}-${i}`}
+              c={c}
+              index={i}
+              total={candidates.length}
+            />
           ))}
         </div>
       </div>
@@ -1645,6 +1872,7 @@ type ResultState = {
   seed: string;
   pending: boolean;
   candidates: Candidate[];
+  batchMetrics: BatchMetrics | null;
   error: string | null;
 } | null;
 
@@ -1657,26 +1885,37 @@ export default function Landing() {
   const onSubmit = useCallback((seed: string) => {
     const myRequestId = ++requestIdRef.current;
     setGenerating(true);
-    setResults({ seed, pending: true, candidates: [], error: null });
+    setResults({
+      seed,
+      pending: true,
+      candidates: [],
+      batchMetrics: null,
+      error: null,
+    });
 
     generateMolecules(seed, 3)
-      .then((molecules) => {
+      .then(({ molecules, batchMetrics }) => {
         if (myRequestId !== requestIdRef.current) return;
-        const cleaned = molecules
-          .map((m) => m.trim())
-          .filter((m) => m.length > 0);
-        if (cleaned.length === 0) {
+        if (molecules.length === 0) {
           setResults({
             seed,
             pending: true,
             candidates: [],
+            batchMetrics,
             error: "Backend returned no molecules.",
           });
           return;
         }
-        const list = cleaned.map(deriveMetrics);
-        list.sort((a, b) => b.score - a.score);
-        setResults({ seed, pending: true, candidates: list, error: null });
+        const list = molecules
+          .map(toCandidate)
+          .sort((a, b) => b.shScore - a.shScore);
+        setResults({
+          seed,
+          pending: true,
+          candidates: list,
+          batchMetrics,
+          error: null,
+        });
       })
       .catch((e: unknown) => {
         if (myRequestId !== requestIdRef.current) return;
@@ -1685,6 +1924,7 @@ export default function Landing() {
           seed,
           pending: true,
           candidates: [],
+          batchMetrics: null,
           error: message,
         });
       });
@@ -1725,6 +1965,7 @@ export default function Landing() {
             <Results
               seed={results.seed}
               candidates={results.candidates}
+              batchMetrics={results.batchMetrics}
               onClose={() => setResults(null)}
             />
           </div>
