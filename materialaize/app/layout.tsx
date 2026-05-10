@@ -17,7 +17,7 @@ const spaceGrotesk = Space_Grotesk({
 export const metadata: Metadata = {
   title: "Materialaize — Self-healing polymer generation",
   description:
-    "A 4.7M-parameter model fine-tuned on 18 years of polymer chemistry literature. Submit a SMILES seed; receive viable candidates ranked by healing efficiency, glass transition, and tensile recovery.",
+    "ChemGPT-4.7M (autoregressive Transformer trained on PubChem10M SELFIES) with a LoRA adapter biased toward self-healing polymer continuations. Submit a SMILES seed; candidates are scored on disulfide / urea / H-bond motifs and synthetic accessibility.",
 };
 
 export default function RootLayout({

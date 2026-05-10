@@ -10,11 +10,11 @@ const API_URL =
   process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 const PHASES = [
-  "PARSING_SEED",
-  "EMBEDDING_TO_LATENT",
-  "SAMPLING_NEIGHBORHOOD",
-  "EVAL_HEALING_KINETICS",
-  "RANKING_CANDIDATES",
+  "ENCODING_SELFIES",
+  "AUTOREGRESSIVE_SAMPLING",
+  "DECODING_SMILES",
+  "RDKIT_VALIDATION",
+  "MOTIF_SCORING",
 ];
 
 type Molecule = {
@@ -620,7 +620,7 @@ function HeroInput({ onSubmit }: { onSubmit: (seed: string) => void }) {
         }}
       >
         <span>
-          <BlinkDot /> READY · CONSTRAINTS: HEALING ≥ 70%
+          <BlinkDot /> READY · ChemGPT-4.7M + LoRA · RDKit motif scoring
         </span>
         <span>↵ TO GENERATE 3 CANDIDATES</span>
       </div>
@@ -630,18 +630,48 @@ function HeroInput({ onSubmit }: { onSubmit: (seed: string) => void }) {
 
 // ─── Telemetry strip ──────────────────────────────────────────────────────────
 
+type Health = {
+  status?: string;
+  model?: string;
+  device?: string;
+  selfies_version?: string;
+  sa_scorer?: boolean;
+};
+
 function Telemetry() {
-  const [tick, setTick] = useState(0);
+  const [health, setHealth] = useState<Health | null>(null);
+  const [reachable, setReachable] = useState<boolean | null>(null);
+
   useEffect(() => {
-    const id = setInterval(() => setTick((t) => t + 1), 1500);
-    return () => clearInterval(id);
+    let cancelled = false;
+    fetch(`${API_URL}/health`)
+      .then((r) => r.json())
+      .then((j: Health) => {
+        if (!cancelled) {
+          setHealth(j);
+          setReachable(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setReachable(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
+  const dash = "—";
   const items = [
-    { k: "LATENT_DIM", v: "4096" },
-    { k: "TRAINING_SET", v: "2.1M_polymers" },
-    { k: "INFERENCE", v: `${420 + (tick % 7) * 13}ms` },
-    { k: "NODE", v: "us-west-2.a" },
+    { k: "BASE", v: "ChemGPT-4.7M" },
+    { k: "ADAPTER", v: "LoRA · r32" },
+    {
+      k: "SELFIES",
+      v: health?.selfies_version ? `v${health.selfies_version}` : dash,
+    },
+    {
+      k: "DEVICE",
+      v: reachable === false ? "offline" : (health?.device ?? dash),
+    },
   ];
 
   return (
@@ -730,7 +760,7 @@ function Hero({ onSubmit }: { onSubmit: (seed: string) => void }) {
           }}
         >
           <BlinkDot />
-          Generation engine online · 412k candidates synthesized
+          ChemGPT-4.7M + LoRA · 7 self-healing motif checks
         </div>
 
         {/* Headline */}
@@ -775,9 +805,10 @@ function Hero({ onSubmit }: { onSubmit: (seed: string) => void }) {
             color: "var(--fg-dim)",
           }}
         >
-          A 4.7M-parameter model fine-tuned on 18 years of polymer chemistry
-          literature. Submit a SMILES seed; receive viable candidates ranked by
-          healing efficiency, glass transition, and tensile recovery.
+          ChemGPT-4.7M (autoregressive Transformer trained on PubChem10M
+          SELFIES) with a LoRA adapter biased toward self-healing polymer
+          continuations. Submit a SMILES seed; candidates are scored on
+          disulfide / urea / H-bond motifs and synthetic accessibility.
         </p>
 
         <HeroInput onSubmit={onSubmit} />
@@ -1565,19 +1596,19 @@ function HowItWorks() {
       n: "01",
       title: "Seed",
       tag: "INPUT",
-      body: "Submit a SMILES string — a known polymer, a fragment, or a designed motif. The model parses connectivity and stereochemistry.",
+      body: "Submit a SMILES string — a known polymer, a fragment, or a designed motif. The seed is encoded as SELFIES tokens before generation.",
     },
     {
       n: "02",
-      title: "Latent traversal",
+      title: "Sample",
       tag: "INFERENCE",
-      body: "A graph-attention encoder projects the seed into a 4096-dimensional latent space. The decoder samples neighborhoods biased toward known healing motifs.",
+      body: "An autoregressive Transformer (ChemGPT-4.7M) samples SELFIES tokens one at a time. The LoRA adapter shifts the next-token distribution toward self-healing polymer continuations.",
     },
     {
       n: "03",
-      title: "Rank",
+      title: "Score",
       tag: "OUTPUT",
-      body: "Candidates are scored by a multi-objective head — healing efficiency, glass transition, tensile recovery, and synthesizability — then returned ranked.",
+      body: "Outputs decode back to SMILES; RDKit validates them and seven SMARTS patterns check for self-healing motifs (disulfide, urea, amide H-bond, furan, imine, boronic ester, DA adduct). A composite 0–100 Self-Healing Quality score combines motif hits, polymer continuation, synthetic accessibility, and molecular weight.",
     },
   ];
 
@@ -1625,7 +1656,7 @@ function HowItWorks() {
               fontWeight: 300,
             }}
           >
-            under a second
+            seconds
           </span>
           .
         </h2>
@@ -1710,6 +1741,13 @@ function Footer() {
       href: "https://huggingface.co/ncfrey/ChemGPT-4.7M",
     },
     {
+      id: "2020.10",
+      title: "Self-Referencing Embedded Strings (SELFIES): A 100% robust molecular string representation",
+      authors: "Krenn et al.",
+      venue: "Mach. Learn.: Sci. Technol.",
+      href: "https://iopscience.iop.org/article/10.1088/2632-2153/aba947",
+    },
+    {
       id: "2020.09",
       title: "PI1M: A Benchmark Database for Polymer Informatics",
       authors: "Ma, Luo",
@@ -1717,18 +1755,11 @@ function Footer() {
       href: "https://pubs.acs.org/doi/10.1021/acs.jcim.0c00726",
     },
     {
-      id: "2024.06",
-      title: "Materialaize-3.1 model card and training corpus",
-      authors: "Materialaize Lab",
-      venue: "Tech report",
-      href: "#",
-    },
-    {
-      id: "2023.09",
-      title: "Disulfide-rich elastomers via generative sampling",
-      authors: "Aoki, Park",
-      venue: "Nature Chemistry",
-      href: "#",
+      id: "lora",
+      title: "LoRA: Low-Rank Adaptation of Large Language Models",
+      authors: "Hu et al.",
+      venue: "arXiv 2106.09685",
+      href: "https://arxiv.org/abs/2106.09685",
     },
   ];
 
