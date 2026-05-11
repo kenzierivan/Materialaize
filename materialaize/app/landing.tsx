@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
+import { createPortal } from "react-dom";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -112,6 +113,52 @@ function selfHealingScore(m: Molecule): number {
   const mw = m.molecular_weight ?? 0;
   if (mw >= 100 && mw <= 600) s += 15;
   return Math.min(100, s);
+}
+
+// Same rules as selfHealingScore, but returns each contribution separately
+// for the EXPAND DETAILS panel. Keep these two functions in sync.
+type SHContribution = {
+  label: string;
+  awarded: number;
+  max: number;
+  reason: string;
+};
+
+function selfHealingBreakdown(m: Molecule): SHContribution[] {
+  const mw = m.molecular_weight ?? 0;
+  const inMwRange = mw >= 100 && mw <= 600;
+  return [
+    {
+      label: "strict SH motif",
+      awarded: m.has_strict_sh ? 45 : 0,
+      max: 45,
+      reason: "disulfide or urea (covalent-exchange chemistry)",
+    },
+    {
+      label: "any SH motif",
+      awarded: !m.has_strict_sh && m.has_any_sh_motif ? 20 : 0,
+      max: 20,
+      reason: "amide H-bond / furan / imine / boronic ester / DA",
+    },
+    {
+      label: "polymer continuation",
+      awarded: m.is_polymer ? 20 : 0,
+      max: 20,
+      reason: "* marker in canonical SMILES",
+    },
+    {
+      label: "synthesisable",
+      awarded: m.synthesisable === true ? 20 : 0,
+      max: 20,
+      reason: "SA score ≤ 6",
+    },
+    {
+      label: "MW range",
+      awarded: inMwRange ? 15 : 0,
+      max: 15,
+      reason: "100–600 g/mol (monomer/oligomer)",
+    },
+  ];
 }
 
 function toCandidate(m: Molecule): Candidate {
@@ -1091,6 +1138,8 @@ function CandidateCard({
   index: number;
   total: number;
 }) {
+  const [expanded, setExpanded] = useState(false);
+
   const motifList =
     c.motifs_found && c.motifs_found.length > 0
       ? c.motifs_found.map((m) => m.replace(/_/g, " ")).join(", ")
@@ -1297,6 +1346,378 @@ function CandidateCard({
           ▸ RDKit could not parse this output as a valid molecule.
         </div>
       )}
+
+      <button
+        type="button"
+        onClick={() => setExpanded(true)}
+        style={{
+          width: "100%",
+          marginTop: 16,
+          padding: "8px 0",
+          background: "transparent",
+          border: "none",
+          borderTop: "1px solid var(--border)",
+          color: "var(--fg-dim)",
+          fontFamily: "var(--mono)",
+          fontSize: 10,
+          letterSpacing: "0.18em",
+          textTransform: "uppercase",
+          cursor: "pointer",
+          transition: "color 0.2s",
+        }}
+        onMouseEnter={(e) => (e.currentTarget.style.color = ACCENT)}
+        onMouseLeave={(e) => (e.currentTarget.style.color = "var(--fg-dim)")}
+      >
+        VIEW DETAILS →
+      </button>
+
+      {expanded && (
+        <CandidateModal c={c} onClose={() => setExpanded(false)} />
+      )}
+    </div>
+  );
+}
+
+function CandidateModal({
+  c,
+  onClose,
+}: {
+  c: Candidate;
+  onClose: () => void;
+}) {
+  // ESC to close + lock page scroll while open. Lock both <html> and <body>
+  // because browsers differ on which one owns the document scrollbar.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    const html = document.documentElement;
+    const body = document.body;
+    const prevHtml = html.style.overflow;
+    const prevBody = body.style.overflow;
+    html.style.overflow = "hidden";
+    body.style.overflow = "hidden";
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      html.style.overflow = prevHtml;
+      body.style.overflow = prevBody;
+    };
+  }, [onClose]);
+
+  const breakdown = c.valid ? selfHealingBreakdown(c) : [];
+  const synthLabel =
+    c.sa_score == null
+      ? "N/A"
+      : c.sa_score <= 4
+        ? "easy"
+        : c.sa_score <= 6
+          ? "moderate"
+          : "hard";
+
+  // SSR guard — document only exists in the browser
+  if (typeof document === "undefined") return null;
+
+  return createPortal(
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(5,6,7,0.88)",
+        backdropFilter: "blur(20px)",
+        WebkitBackdropFilter: "blur(20px)",
+        zIndex: 50,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "5vh 5vw",
+        animation: "fadeIn 0.2s ease",
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="no-scrollbar"
+        style={{
+          position: "relative",
+          background: "rgba(10,13,16,0.97)",
+          border: "1px solid var(--border-strong)",
+          width: "100%",
+          maxWidth: 1100,
+          height: "90vh",
+          overflowY: "auto",
+          overflowX: "hidden",
+          padding: 40,
+          animation: "slideUp 0.3s ease",
+        }}
+      >
+        <Bracket pos="tl" color={ACCENT} />
+        <Bracket pos="tr" color={ACCENT} />
+        <Bracket pos="bl" color={ACCENT} />
+        <Bracket pos="br" color={ACCENT} />
+
+        {/* Header */}
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "baseline",
+            marginBottom: 20,
+            paddingBottom: 16,
+            borderBottom: "1px solid var(--border)",
+          }}
+        >
+          <div
+            style={{
+              fontFamily: "var(--mono)",
+              fontSize: 11,
+              letterSpacing: "0.18em",
+              color: c.valid ? ACCENT : "#ff8899",
+            }}
+          >
+            {c.id} · CANDIDATE DETAILS
+            {!c.valid && (
+              <span style={{ marginLeft: 12, color: "#ff8899" }}>
+                · INVALID
+              </span>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            style={{
+              background: "transparent",
+              border: "1px solid var(--border)",
+              color: "var(--fg-dim)",
+              padding: "6px 12px",
+              fontFamily: "var(--mono)",
+              fontSize: 10,
+              letterSpacing: "0.18em",
+              textTransform: "uppercase",
+              cursor: "pointer",
+              transition: "color 0.2s, border-color 0.2s",
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.color = ACCENT;
+              e.currentTarget.style.borderColor = ACCENT;
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.color = "var(--fg-dim)";
+              e.currentTarget.style.borderColor = "var(--border)";
+            }}
+          >
+            ✕ Close · ESC
+          </button>
+        </div>
+
+        {/* SH Quality bar — repeated in the modal so it's always visible */}
+        {c.valid && (
+          <div style={{ marginBottom: 8 }}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                fontFamily: "var(--mono)",
+                fontSize: 9,
+                letterSpacing: "0.18em",
+                color: "var(--fg-dim)",
+                marginBottom: 6,
+              }}
+            >
+              <span>SELF-HEALING QUALITY</span>
+              <span style={{ color: ACCENT }}>{c.shScore}/100</span>
+            </div>
+            <div
+              style={{
+                height: 4,
+                background: "var(--border)",
+                position: "relative",
+              }}
+            >
+              <div
+                style={{
+                  position: "absolute",
+                  left: 0,
+                  top: 0,
+                  bottom: 0,
+                  width: `${c.shScore}%`,
+                  background: ACCENT,
+                  boxShadow: c.shScore > 0 ? `0 0 8px ${ACCENT}88` : undefined,
+                }}
+              />
+            </div>
+          </div>
+        )}
+
+        <SectionHeader>Representations</SectionHeader>
+        <DefList
+          rows={[
+            ["CANONICAL", c.canonical_smiles ?? "—"],
+            ["SMILES", c.smiles ?? "—"],
+            ["SELFIES", c.selfies || "—"],
+          ]}
+          mono
+        />
+
+        {c.valid ? (
+          <>
+            <SectionHeader>SH Quality breakdown</SectionHeader>
+            <div
+              style={{
+                fontFamily: "var(--mono)",
+                fontSize: 11,
+                lineHeight: 1.8,
+              }}
+            >
+              {breakdown.map((b) => (
+                <div
+                  key={b.label}
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "180px 80px 1fr",
+                    gap: 12,
+                    color: b.awarded > 0 ? "var(--fg)" : "var(--fg-dimmer)",
+                  }}
+                >
+                  <span>{b.label}</span>
+                  <span
+                    style={{
+                      color: b.awarded > 0 ? ACCENT : "var(--fg-dimmer)",
+                    }}
+                  >
+                    +{b.awarded} / {b.max}
+                  </span>
+                  <span style={{ color: "var(--fg-dim)" }}>{b.reason}</span>
+                </div>
+              ))}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "180px 80px 1fr",
+                  gap: 12,
+                  marginTop: 8,
+                  paddingTop: 8,
+                  borderTop: "1px solid var(--border)",
+                  color: "var(--fg)",
+                }}
+              >
+                <span>total</span>
+                <span style={{ color: ACCENT }}>{c.shScore} / 100</span>
+                <span />
+              </div>
+            </div>
+
+            <SectionHeader>Descriptors</SectionHeader>
+            <DefList
+              rows={[
+                [
+                  "Molecular weight",
+                  c.molecular_weight != null
+                    ? `${c.molecular_weight.toFixed(2)} g/mol`
+                    : "—",
+                ],
+                ["Heavy atoms", String(c.num_heavy_atoms ?? "—")],
+                ["Rings", String(c.num_rings ?? "—")],
+                [
+                  "SA score",
+                  c.sa_score != null
+                    ? `${c.sa_score.toFixed(2)} (${synthLabel})`
+                    : "N/A",
+                ],
+                ["Polymer flag", c.is_polymer ? "yes" : "no"],
+                [
+                  "Synthesisable",
+                  c.synthesisable === true
+                    ? "yes"
+                    : c.synthesisable === false
+                      ? "no"
+                      : "N/A",
+                ],
+                [
+                  "Motifs detected",
+                  c.motifs_found && c.motifs_found.length > 0
+                    ? c.motifs_found.join(", ")
+                    : "none",
+                ],
+              ]}
+            />
+          </>
+        ) : (
+          <div
+            style={{
+              marginTop: 16,
+              fontFamily: "var(--mono)",
+              fontSize: 11,
+              color: "var(--fg-dim)",
+              padding: 12,
+              border: "1px solid #44222a",
+              background: "rgba(60,10,20,0.2)",
+            }}
+          >
+            ▸ Metrics unavailable — RDKit could not parse the decoded SMILES.
+          </div>
+        )}
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+function SectionHeader({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        fontFamily: "var(--mono)",
+        fontSize: 9,
+        letterSpacing: "0.22em",
+        textTransform: "uppercase",
+        color: ACCENT,
+        marginTop: 16,
+        marginBottom: 10,
+        paddingBottom: 6,
+        borderBottom: "1px dashed var(--border)",
+      }}
+    >
+      ── {children} ──
+    </div>
+  );
+}
+
+function DefList({
+  rows,
+  mono,
+}: {
+  rows: [string, string][];
+  mono?: boolean;
+}) {
+  return (
+    <div
+      style={{
+        fontFamily: "var(--mono)",
+        fontSize: 11,
+        lineHeight: 1.8,
+      }}
+    >
+      {rows.map(([label, value]) => (
+        <div
+          key={label}
+          style={{
+            display: "grid",
+            gridTemplateColumns: "180px 1fr",
+            gap: 12,
+          }}
+        >
+          <span style={{ color: "var(--fg-dim)" }}>{label}</span>
+          <span
+            style={{
+              color: "var(--fg)",
+              wordBreak: mono ? "break-all" : "normal",
+            }}
+          >
+            {value}
+          </span>
+        </div>
+      ))}
     </div>
   );
 }

@@ -111,3 +111,12 @@ button {
     display: none !important;
   }
 }
+
+/* Hide scrollbars on scrollable surfaces that should still respond to wheel/touch */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
