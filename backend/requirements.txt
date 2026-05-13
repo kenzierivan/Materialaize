@@ -9,3 +9,5 @@ tokenizers
 selfies==1.0.3
 rdkit-pypi
 numpy
+anthropic
+python-dotenv

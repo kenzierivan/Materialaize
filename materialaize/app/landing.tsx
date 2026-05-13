@@ -85,6 +85,30 @@ async function generateMolecules(
   return { molecules: data.molecules, batchMetrics: data.batch_metrics };
 }
 
+async function explainMolecule(c: Candidate): Promise<string> {
+  const res = await fetch(`${API_URL}/explain`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      smiles: c.canonical_smiles ?? c.smiles ?? "",
+      motifs_found: c.motifs_found ?? [],
+      sa_score: c.sa_score ?? null,
+      molecular_weight: c.molecular_weight ?? null,
+      num_heavy_atoms: c.num_heavy_atoms ?? null,
+      num_rings: c.num_rings ?? null,
+      is_polymer: c.is_polymer ?? null,
+      synthesisable: c.synthesisable ?? null,
+      has_strict_sh: c.has_strict_sh ?? null,
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`Backend ${res.status}: ${text || res.statusText}`);
+  }
+  const data = (await res.json()) as { explanation: string };
+  return data.explanation;
+}
+
 // Deterministic FNV hash → MTZ-XXXX card label.
 function makeId(seed: string): string {
   let h = 2166136261;
@@ -1139,6 +1163,8 @@ function CandidateCard({
   total: number;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [explanation, setExplanation] = useState<string | null>(null);
+  const [explanationError, setExplanationError] = useState<string | null>(null);
 
   const motifList =
     c.motifs_found && c.motifs_found.length > 0
@@ -1372,7 +1398,14 @@ function CandidateCard({
       </button>
 
       {expanded && (
-        <CandidateModal c={c} onClose={() => setExpanded(false)} />
+        <CandidateModal
+          c={c}
+          onClose={() => setExpanded(false)}
+          cachedExplanation={explanation}
+          cachedExplanationError={explanationError}
+          onExplanation={setExplanation}
+          onExplanationError={setExplanationError}
+        />
       )}
     </div>
   );
@@ -1381,9 +1414,17 @@ function CandidateCard({
 function CandidateModal({
   c,
   onClose,
+  cachedExplanation,
+  cachedExplanationError,
+  onExplanation,
+  onExplanationError,
 }: {
   c: Candidate;
   onClose: () => void;
+  cachedExplanation: string | null;
+  cachedExplanationError: string | null;
+  onExplanation: (text: string) => void;
+  onExplanationError: (msg: string) => void;
 }) {
   // ESC to close + lock page scroll while open. Lock both <html> and <body>
   // because browsers differ on which one owns the document scrollbar.
@@ -1414,6 +1455,35 @@ function CandidateModal({
         : c.sa_score <= 6
           ? "moderate"
           : "hard";
+
+  // Fetch AI explanation when modal opens — only if not already cached
+  // (cache lives on the parent CandidateCard so it survives modal remount).
+  // Skip when candidate is invalid (no SMILES worth explaining).
+  const hasSmilesToExplain = c.valid && Boolean(c.canonical_smiles ?? c.smiles);
+  const explanationLoading =
+    hasSmilesToExplain &&
+    cachedExplanation === null &&
+    cachedExplanationError === null;
+
+  useEffect(() => {
+    if (!explanationLoading) return;
+    let cancelled = false;
+    explainMolecule(c)
+      .then((text) => {
+        if (!cancelled) onExplanation(text);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) {
+          onExplanationError(e instanceof Error ? e.message : String(e));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+    // We intentionally only kick this off once per mount — cache lives in the
+    // parent, so a remount with cache populated will not re-enter the branch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // SSR guard — document only exists in the browser
   if (typeof document === "undefined") return null;
@@ -1657,9 +1727,214 @@ function CandidateModal({
             ▸ Metrics unavailable — RDKit could not parse the decoded SMILES.
           </div>
         )}
+
+        <SectionHeader>Structure</SectionHeader>
+        <MoleculeStructure smiles={c.canonical_smiles ?? c.smiles ?? null} />
+
+        <AIExplanationPanel
+          loading={explanationLoading}
+          error={cachedExplanationError}
+          text={cachedExplanation}
+          disabled={!hasSmilesToExplain}
+        />
       </div>
     </div>,
     document.body,
+  );
+}
+
+function MoleculeStructure({ smiles }: { smiles: string | null }) {
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    if (!smiles || smiles === "INVALID" || !svgRef.current) return;
+    setError(false);
+    let cancelled = false;
+    (async () => {
+      // smiles-drawer's src/ tree is unbuildable (mixes .js with .ts files);
+      // load the pre-built IIFE dist bundle instead, which registers
+      // `window.SmilesDrawer`. The dist file has no types of its own.
+      // @ts-expect-error - untyped browser bundle, declares only via side effect
+      await import("smiles-drawer/dist/smiles-drawer.min.js");
+      if (cancelled) return;
+      const SD = window.SmilesDrawer;
+      if (!SD || !svgRef.current) {
+        setError(true);
+        return;
+      }
+      const drawer = new SD.SvgDrawer({
+        width: 520,
+        height: 280,
+        bondThickness: 1.1,
+        padding: 12,
+      });
+      SD.parse(
+        smiles,
+        (tree) => {
+          if (cancelled || !svgRef.current) return;
+          svgRef.current.innerHTML = "";
+          drawer.draw(tree, svgRef.current, "dark");
+        },
+        () => {
+          if (!cancelled) setError(true);
+        },
+      );
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [smiles]);
+
+  if (!smiles || smiles === "INVALID") {
+    return (
+      <div
+        style={{
+          fontFamily: "var(--mono)",
+          fontSize: 11,
+          color: "var(--fg-dim)",
+          padding: 12,
+          border: "1px dashed var(--border)",
+        }}
+      >
+        ▸ No structure preview — SMILES could not be decoded.
+      </div>
+    );
+  }
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        justifyContent: "center",
+        alignItems: "center",
+        padding: 16,
+        background: "rgba(0,0,0,0.25)",
+        border: "1px solid var(--border)",
+        minHeight: 280,
+      }}
+    >
+      {error ? (
+        <div
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            color: "var(--fg-dim)",
+          }}
+        >
+          ▸ Could not render structure for: {smiles}
+        </div>
+      ) : (
+        <svg
+          ref={svgRef}
+          width={520}
+          height={280}
+          role="img"
+          aria-label={`2D structure of ${smiles}`}
+        />
+      )}
+    </div>
+  );
+}
+
+function AIExplanationPanel({
+  loading,
+  error,
+  text,
+  disabled,
+}: {
+  loading: boolean;
+  error: string | null;
+  text: string | null;
+  disabled: boolean;
+}) {
+  return (
+    <div
+      style={{
+        marginTop: 20,
+        padding: 18,
+        border: `1px solid ${ACCENT}40`,
+        background: "rgba(0,255,157,0.04)",
+        position: "relative",
+      }}
+    >
+      <div
+        style={{
+          fontFamily: "var(--mono)",
+          fontSize: 10,
+          letterSpacing: "0.24em",
+          textTransform: "uppercase",
+          color: ACCENT,
+          marginBottom: 12,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+        }}
+      >
+        <span style={{ color: ACCENT }}>▌</span>
+        AI ANALYSIS
+        <span style={{ color: "var(--fg-dimmer)", fontSize: 9 }}>
+          · claude-sonnet-4
+        </span>
+        {loading && (
+          <span
+            className="blink"
+            style={{ color: ACCENT, marginLeft: 4, fontSize: 9 }}
+          >
+            ●
+          </span>
+        )}
+      </div>
+
+      {disabled ? (
+        <div
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            color: "var(--fg-dim)",
+          }}
+        >
+          ▸ Skipped — no decoded SMILES to analyse.
+        </div>
+      ) : loading ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {[100, 92, 78].map((w, i) => (
+            <div
+              key={i}
+              style={{
+                height: 12,
+                width: `${w}%`,
+                background: `linear-gradient(90deg, ${ACCENT}22, ${ACCENT}11)`,
+                animation: "pulse 1.4s ease-in-out infinite",
+                animationDelay: `${i * 0.15}s`,
+              }}
+            />
+          ))}
+        </div>
+      ) : error ? (
+        <div
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            color: "#ff8899",
+          }}
+        >
+          ▸ Could not load explanation: {error}
+        </div>
+      ) : text ? (
+        <div
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 12.5,
+            lineHeight: 1.7,
+            color: "var(--fg)",
+            whiteSpace: "pre-wrap",
+          }}
+        >
+          {text}
+        </div>
+      ) : null}
+    </div>
   );
 }
 

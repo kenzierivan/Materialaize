@@ -17,6 +17,22 @@ import selfies as sf
 import os
 import sys
 
+# Load .env (ANTHROPIC_API_KEY etc.) before any client uses os.environ.
+# Looks for backend/.env relative to this file, so it works regardless of CWD.
+try:
+    from dotenv import load_dotenv
+    _env_path = os.path.join(os.path.dirname(__file__), ".env")
+    _loaded = load_dotenv(_env_path)
+    print(f"[env] load_dotenv path={_env_path} exists={os.path.exists(_env_path)} loaded_any={_loaded}")
+except ImportError:
+    print("[env] python-dotenv not installed — relying on shell env vars only.")
+
+_key = os.environ.get("ANTHROPIC_API_KEY")
+if _key:
+    print(f"[env] ANTHROPIC_API_KEY present: len={len(_key)} prefix={_key[:10]}...")
+else:
+    print("[env] ANTHROPIC_API_KEY is NOT set after load.")
+
 # ── Verify SELFIES version ────────────────────────────────────────────
 assert sf.__version__.startswith('1.0'), (
     f'SELFIES v2.x detected ({sf.__version__}) — breaks ChemGPT vocab. '
@@ -27,6 +43,17 @@ print(f'selfies version OK: {sf.__version__}')
 # ── RDKit imports ──────────────────────────────────────────────────────
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors, DataStructs, rdMolDescriptors
+
+# ── Anthropic client (for /explain endpoint) ──────────────────────────
+try:
+    from anthropic import Anthropic
+    anthropic_client = Anthropic()  # reads ANTHROPIC_API_KEY from env
+    ANTHROPIC_AVAILABLE = True
+    print("Anthropic client initialised.")
+except Exception as e:
+    print(f"Anthropic client unavailable ({e}) — /explain will return 503")
+    anthropic_client = None
+    ANTHROPIC_AVAILABLE = False
 
 # ── SA Scorer setup (same as Colab Section B) ─────────────────────────
 SA_SCORER_AVAILABLE = False
@@ -401,6 +428,64 @@ def generate(req: GenerateRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Explanation endpoint (Anthropic Claude) ───────────────────────────
+class ExplainRequest(BaseModel):
+    smiles: str
+    motifs_found: list[str] = []
+    sa_score: float | None = None
+    molecular_weight: float | None = None
+    num_heavy_atoms: int | None = None
+    num_rings: int | None = None
+    is_polymer: bool | None = None
+    synthesisable: bool | None = None
+    has_strict_sh: bool | None = None
+
+
+def _build_explain_prompt(req: ExplainRequest) -> str:
+    motifs = ", ".join(req.motifs_found) if req.motifs_found else "none"
+    return (
+        "You are a materials science assistant analysing a candidate "
+        "self-healing polymer molecule for a researcher.\n\n"
+        f"Molecule (SMILES): {req.smiles}\n\n"
+        "Detected metrics:\n"
+        f"- Self-healing motifs found: {motifs}\n"
+        f"- Has strict-SH motif (disulfide or urea): {req.has_strict_sh}\n"
+        f"- Synthetic accessibility score (1=easy, 10=hard): {req.sa_score}\n"
+        f"- Synthesisable (SA <= 6): {req.synthesisable}\n"
+        f"- Molecular weight: {req.molecular_weight} g/mol\n"
+        f"- Heavy atom count: {req.num_heavy_atoms}\n"
+        f"- Ring count: {req.num_rings}\n"
+        f"- Polymer (has * attachment points): {req.is_polymer}\n\n"
+        "In 2-3 concise sentences, explain to a materials science researcher:\n"
+        "1. What self-healing mechanism the detected motifs would enable "
+        "(e.g. disulfide metathesis, urea H-bond exchange, Diels-Alder).\n"
+        "2. Whether this molecule is practically synthesisable given its SA score.\n"
+        "3. Any notable structural observations (ring system, MW range, polymer endpoints).\n\n"
+        "Be specific and technical. Avoid generic statements."
+    )
+
+
+@app.post("/explain")
+def explain(req: ExplainRequest):
+    if not ANTHROPIC_AVAILABLE or anthropic_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Anthropic client not initialised — set ANTHROPIC_API_KEY and restart.",
+        )
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=300,
+            messages=[{"role": "user", "content": _build_explain_prompt(req)}],
+        )
+        text = "".join(
+            block.text for block in response.content if getattr(block, "text", None)
+        ).strip()
+        return {"explanation": text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Anthropic API error: {e}")
 
 
 if __name__ == "__main__":
