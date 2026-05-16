@@ -126,7 +126,10 @@ function makeId(seed: string): string {
 //   +20 any other SH motif (amide H-bond, furan, imine, boronic ester, DA)
 //   +20 polymer continuation (* atoms — model thinks this extends as a chain)
 //   +20 synthesisable (SA score ≤ 6)
-//   +15 MW in monomer/oligomer range (100–600 g/mol)
+//   +15 MW in monomer/oligomer range (100–1000 g/mol)
+//   +5 per motif beyond the first (capped at +15) — rewards multi-mechanism
+//      candidates that combine e.g. disulfide + urea + amide for more robust
+//      self-healing than a single-motif molecule
 function selfHealingScore(m: Molecule): number {
   if (!m.valid) return 0;
   let s = 0;
@@ -135,7 +138,9 @@ function selfHealingScore(m: Molecule): number {
   if (m.is_polymer) s += 20;
   if (m.synthesisable === true) s += 20;
   const mw = m.molecular_weight ?? 0;
-  if (mw >= 100 && mw <= 600) s += 15;
+  if (mw >= 100 && mw <= 1000) s += 15;
+  const motifCount = m.motifs_found?.length ?? 0;
+  s += Math.min(15, Math.max(0, motifCount - 1) * 5);
   return Math.min(100, s);
 }
 
@@ -150,7 +155,9 @@ type SHContribution = {
 
 function selfHealingBreakdown(m: Molecule): SHContribution[] {
   const mw = m.molecular_weight ?? 0;
-  const inMwRange = mw >= 100 && mw <= 600;
+  const inMwRange = mw >= 100 && mw <= 1000;
+  const motifCount = m.motifs_found?.length ?? 0;
+  const motifBonus = Math.min(15, Math.max(0, motifCount - 1) * 5);
   return [
     {
       label: "strict SH motif",
@@ -180,7 +187,13 @@ function selfHealingBreakdown(m: Molecule): SHContribution[] {
       label: "MW range",
       awarded: inMwRange ? 15 : 0,
       max: 15,
-      reason: "100–600 g/mol (monomer/oligomer)",
+      reason: "100–1000 g/mol (monomer/oligomer)",
+    },
+    {
+      label: "motif diversity",
+      awarded: motifBonus,
+      max: 15,
+      reason: `+5 per motif beyond the first (found ${motifCount})`,
     },
   ];
 }
