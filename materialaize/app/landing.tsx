@@ -1756,9 +1756,22 @@ function CandidateModal({
   );
 }
 
+const MOL_W = 520;
+const MOL_H = 280;
+const ZOOM_MIN = 0.5;
+const ZOOM_MAX = 5;
+const ZOOM_STEP = 0.25;
+
 function MoleculeStructure({ smiles }: { smiles: string | null }) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [error, setError] = useState(false);
+  const [zoom, setZoom] = useState(1);
+
+  // Reset zoom whenever a new SMILES is rendered (opening a different modal
+  // shouldn't inherit the previous candidate's zoom level).
+  useEffect(() => {
+    setZoom(1);
+  }, [smiles]);
 
   useEffect(() => {
     if (!smiles || smiles === "INVALID" || !svgRef.current) return;
@@ -1777,8 +1790,8 @@ function MoleculeStructure({ smiles }: { smiles: string | null }) {
         return;
       }
       const drawer = new SD.SvgDrawer({
-        width: 520,
-        height: 280,
+        width: MOL_W,
+        height: MOL_H,
         bondThickness: 1.1,
         padding: 12,
       });
@@ -1815,21 +1828,105 @@ function MoleculeStructure({ smiles }: { smiles: string | null }) {
     );
   }
 
+  const clamp = (z: number) =>
+    Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.round(z * 100) / 100));
+
+  const btnStyle: React.CSSProperties = {
+    fontFamily: "var(--mono)",
+    fontSize: 12,
+    lineHeight: "20px",
+    width: 24,
+    height: 24,
+    background: "rgba(0,0,0,0.55)",
+    color: "var(--fg)",
+    border: "1px solid var(--border)",
+    cursor: "pointer",
+    padding: 0,
+  };
+
   return (
     <div
       style={{
-        display: "flex",
-        justifyContent: "center",
-        alignItems: "center",
+        position: "relative",
         padding: 16,
         background: "rgba(0,0,0,0.25)",
         border: "1px solid var(--border)",
         minHeight: 280,
       }}
     >
+      {!error && (
+        <div
+          style={{
+            position: "absolute",
+            top: 8,
+            right: 8,
+            display: "flex",
+            alignItems: "center",
+            gap: 4,
+            zIndex: 1,
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            color: "var(--fg-dim)",
+          }}
+        >
+          <button
+            type="button"
+            aria-label="Zoom out"
+            onClick={() => setZoom((z) => clamp(z - ZOOM_STEP))}
+            disabled={zoom <= ZOOM_MIN}
+            style={{
+              ...btnStyle,
+              opacity: zoom <= ZOOM_MIN ? 0.35 : 1,
+              cursor: zoom <= ZOOM_MIN ? "default" : "pointer",
+            }}
+          >
+            −
+          </button>
+          <span
+            style={{
+              minWidth: 38,
+              textAlign: "center",
+              userSelect: "none",
+            }}
+          >
+            {Math.round(zoom * 100)}%
+          </span>
+          <button
+            type="button"
+            aria-label="Reset zoom"
+            onClick={() => setZoom(1)}
+            disabled={zoom === 1}
+            style={{
+              ...btnStyle,
+              opacity: zoom === 1 ? 0.35 : 1,
+              cursor: zoom === 1 ? "default" : "pointer",
+            }}
+          >
+            ⌂
+          </button>
+          <button
+            type="button"
+            aria-label="Zoom in"
+            onClick={() => setZoom((z) => clamp(z + ZOOM_STEP))}
+            disabled={zoom >= ZOOM_MAX}
+            style={{
+              ...btnStyle,
+              opacity: zoom >= ZOOM_MAX ? 0.35 : 1,
+              cursor: zoom >= ZOOM_MAX ? "default" : "pointer",
+            }}
+          >
+            +
+          </button>
+        </div>
+      )}
+
       {error ? (
         <div
           style={{
+            display: "flex",
+            justifyContent: "center",
+            alignItems: "center",
+            minHeight: 248,
             fontFamily: "var(--mono)",
             fontSize: 11,
             color: "var(--fg-dim)",
@@ -1838,13 +1935,41 @@ function MoleculeStructure({ smiles }: { smiles: string | null }) {
           ▸ Could not render structure for: {smiles}
         </div>
       ) : (
-        <svg
-          ref={svgRef}
-          width={520}
-          height={280}
-          role="img"
-          aria-label={`2D structure of ${smiles}`}
-        />
+        // Scroll viewport. `margin: auto` on the inner sizing wrapper centers
+        // it when smaller than the viewport, but yields the top-left when
+        // larger — so zoomed-in content stays scrollable instead of being
+        // clipped off-screen (classic flex-centering-with-overflow fix).
+        <div
+          style={{
+            width: "100%",
+            height: 280,
+            overflow: "auto",
+            display: "flex",
+          }}
+        >
+          <div
+            style={{
+              width: MOL_W * zoom,
+              height: MOL_H * zoom,
+              flexShrink: 0,
+              margin: "auto",
+            }}
+          >
+            <svg
+              ref={svgRef}
+              width={MOL_W}
+              height={MOL_H}
+              role="img"
+              aria-label={`2D structure of ${smiles}`}
+              style={{
+                transform: `scale(${zoom})`,
+                transformOrigin: "top left",
+                display: "block",
+                transition: "transform 0.12s ease-out",
+              }}
+            />
+          </div>
+        </div>
       )}
     </div>
   );
